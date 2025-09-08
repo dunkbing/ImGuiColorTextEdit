@@ -3090,9 +3090,22 @@ void TextEditor::UpdateAutoComplete()
 	
 	// Find matching keywords
 	mAutoCompleteSuggestions.clear();
+	
+	// Check SQL keywords
 	for (const auto& keyword : sqlKeywords)
 	{
 		if (keyword.find(upperWord) == 0 && keyword != upperWord)
+		{
+			mAutoCompleteSuggestions.push_back(keyword);
+		}
+	}
+	
+	// Check extra keywords (table and column names) - case insensitive
+	for (const auto& keyword : mExtraKeywords)
+	{
+		std::string upperKeyword = keyword;
+		std::transform(upperKeyword.begin(), upperKeyword.end(), upperKeyword.begin(), ::toupper);
+		if (upperKeyword.find(upperWord) == 0 && upperKeyword != upperWord)
 		{
 			mAutoCompleteSuggestions.push_back(keyword);
 		}

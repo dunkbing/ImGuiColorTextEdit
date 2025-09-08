@@ -398,6 +398,7 @@ public:
 	void AcceptAutoComplete();
 	std::string GetWordAt(const Coordinates& aCoords) const;
 	std::string GetCurrentWord() const;
+	void SetExtraKeywords(const std::vector<std::string>& keywords) { mExtraKeywords = keywords; }
 
 	void AddUndo(UndoRecord& aValue);
 
@@ -478,4 +479,5 @@ private:
     int mAutoCompleteSelectedIndex = -1;
     Coordinates mAutoCompleteWordStart;
     Coordinates mAutoCompleteWordEnd;
+    std::vector<std::string> mExtraKeywords;
 };
