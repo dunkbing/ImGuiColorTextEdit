@@ -435,6 +435,10 @@ bool TextEditor::Render(const char* aTitle, bool aParentIsFocused, const ImVec2&
 	Render(aParentIsFocused);
 
 	ImGui::EndChild();
+	
+	// Render auto-complete popup for SQL
+	if (mLanguageDefinitionId == LanguageDefinitionId::Sql)
+		RenderAutoComplete();
 
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
@@ -1992,6 +1996,34 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 
 		io.WantCaptureKeyboard = true;
 		io.WantTextInput = true;
+		
+		// Handle auto-complete navigation
+		if (mShowAutoComplete && mLanguageDefinitionId == LanguageDefinitionId::Sql)
+		{
+			if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+			{
+				mShowAutoComplete = false;
+				mAutoCompleteSuggestions.clear();
+				mAutoCompleteSelectedIndex = -1;
+			}
+			else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+			{
+				if (mAutoCompleteSelectedIndex > 0)
+					mAutoCompleteSelectedIndex--;
+				return;
+			}
+			else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+			{
+				if (mAutoCompleteSelectedIndex < (int)mAutoCompleteSuggestions.size() - 1)
+					mAutoCompleteSelectedIndex++;
+				return;
+			}
+			else if (ImGui::IsKeyPressed(ImGuiKey_Tab) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))
+			{
+				AcceptAutoComplete();
+				return;
+			}
+		}
 
 		if (!mReadOnly && isShortcut && ImGui::IsKeyPressed(ImGuiKey_Z))
 			Undo();
@@ -2022,9 +2054,17 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 		else if (!alt && !ctrl && !super && ImGui::IsKeyPressed(ImGuiKey_End))
 			MoveEnd(shift);
 		else if (!mReadOnly && !alt && !shift && !super && ImGui::IsKeyPressed(ImGuiKey_Delete))
+		{
 			Delete(ctrl);
+			if (mLanguageDefinitionId == LanguageDefinitionId::Sql)
+				UpdateAutoComplete();
+		}
 		else if (!mReadOnly && !alt && !shift && !super && ImGui::IsKeyPressed(ImGuiKey_Backspace))
+		{
 			Backspace(ctrl);
+			if (mLanguageDefinitionId == LanguageDefinitionId::Sql)
+				UpdateAutoComplete();
+		}
 		else if (!mReadOnly && !alt && ctrl && shift && !super && ImGui::IsKeyPressed(ImGuiKey_K))
 			RemoveCurrentLines();
 		else if (!mReadOnly && !alt && ctrl && !shift && !super && ImGui::IsKeyPressed(ImGuiKey_LeftBracket))
@@ -2063,7 +2103,12 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 			{
 				auto c = io.InputQueueCharacters[i];
 				if (c != 0 && (c == '\n' || c >= 32))
+				{
 					EnterCharacter(c, shift);
+					// Update auto-complete after character input for SQL
+					if (mLanguageDefinitionId == LanguageDefinitionId::Sql)
+						UpdateAutoComplete();
+				}
 			}
 			io.InputQueueCharacters.resize(0);
 		}
@@ -2953,3 +2998,197 @@ const std::unordered_map<char, char> TextEditor::CLOSE_TO_OPEN_CHAR = {
 };
 
 TextEditor::PaletteId TextEditor::defaultPalette = TextEditor::PaletteId::Dark;
+
+// Auto-complete implementation
+std::string TextEditor::GetCurrentWord() const
+{
+	auto coords = GetSanitizedCursorCoordinates();
+	return GetWordAt(coords);
+}
+
+std::string TextEditor::GetWordAt(const Coordinates& aCoords) const
+{
+	if (aCoords.mLine >= (int)mLines.size())
+		return "";
+	
+	auto& line = mLines[aCoords.mLine];
+	int charIndex = GetCharacterIndexL(aCoords);
+	
+	// Find word start
+	int wordStart = charIndex;
+	while (wordStart > 0 && CharIsWordChar(line[wordStart - 1].mChar))
+		wordStart--;
+	
+	// Find word end
+	int wordEnd = charIndex;
+	while (wordEnd < (int)line.size() && CharIsWordChar(line[wordEnd].mChar))
+		wordEnd++;
+	
+	// Extract word
+	std::string word;
+	for (int i = wordStart; i < wordEnd; i++)
+		word += line[i].mChar;
+	
+	return word;
+}
+
+void TextEditor::UpdateAutoComplete()
+{
+	// Common SQL keywords
+	static const std::vector<std::string> sqlKeywords = {
+		"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
+		"CREATE", "TABLE", "ALTER", "DROP", "INDEX", "VIEW", "DATABASE", "SCHEMA",
+		"JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "FULL", "CROSS", "ON", "USING",
+		"GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
+		"UNION", "ALL", "INTERSECT", "EXCEPT", "DISTINCT", "AS",
+		"AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "NULL",
+		"CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "CONVERT",
+		"COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND", "FLOOR", "CEIL", "ABS",
+		"LENGTH", "SUBSTRING", "CONCAT", "REPLACE", "TRIM", "UPPER", "LOWER",
+		"COALESCE", "NULLIF", "NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+		"PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "CHECK", "DEFAULT",
+		"CASCADE", "RESTRICT", "NO", "ACTION", "CONSTRAINT", "AUTO_INCREMENT",
+		"BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "SAVEPOINT",
+		"GRANT", "REVOKE", "PRIVILEGES", "TO", "PUBLIC", "WITH", "OPTION",
+		"TRIGGER", "BEFORE", "AFTER", "EACH", "ROW", "FOR", "PROCEDURE", "FUNCTION", "RETURN"
+	};
+	
+	// Get current cursor position and word
+	auto coords = GetSanitizedCursorCoordinates();
+	if (coords.mLine >= (int)mLines.size())
+	{
+		mShowAutoComplete = false;
+		return;
+	}
+	
+	auto& line = mLines[coords.mLine];
+	int charIndex = GetCharacterIndexL(coords);
+	
+	// Find word boundaries
+	int wordStart = charIndex;
+	while (wordStart > 0 && CharIsWordChar(line[wordStart - 1].mChar))
+		wordStart--;
+	
+	mAutoCompleteWordStart = Coordinates(coords.mLine, GetCharacterColumn(coords.mLine, wordStart));
+	mAutoCompleteWordEnd = coords;
+	
+	// Extract current partial word
+	std::string currentWord;
+	for (int i = wordStart; i < charIndex; i++)
+		currentWord += line[i].mChar;
+	
+	if (currentWord.empty())
+	{
+		mShowAutoComplete = false;
+		mAutoCompleteSuggestions.clear();
+		return;
+	}
+	
+	// Convert to uppercase for comparison
+	std::string upperWord = currentWord;
+	std::transform(upperWord.begin(), upperWord.end(), upperWord.begin(), ::toupper);
+	
+	// Find matching keywords
+	mAutoCompleteSuggestions.clear();
+	for (const auto& keyword : sqlKeywords)
+	{
+		if (keyword.find(upperWord) == 0 && keyword != upperWord)
+		{
+			mAutoCompleteSuggestions.push_back(keyword);
+		}
+	}
+	
+	// Show auto-complete if we have suggestions
+	if (!mAutoCompleteSuggestions.empty())
+	{
+		mShowAutoComplete = true;
+		mAutoCompleteSelectedIndex = 0;
+	}
+	else
+	{
+		mShowAutoComplete = false;
+		mAutoCompleteSelectedIndex = -1;
+	}
+}
+
+void TextEditor::RenderAutoComplete()
+{
+	if (!mShowAutoComplete || mAutoCompleteSuggestions.empty())
+		return;
+	
+	// Calculate popup position based on cursor
+	auto cursorCoords = GetSanitizedCursorCoordinates();
+	float cursorX = mTextStart + TextDistanceToLineStart(cursorCoords);
+	float cursorY = cursorCoords.mLine * mCharAdvance.y;
+	
+	ImVec2 windowPos = ImGui::GetWindowPos();
+	ImVec2 cursorScreenPos = ImVec2(windowPos.x + cursorX - mScrollX, 
+	                                windowPos.y + cursorY - mScrollY + mCharAdvance.y);
+	
+	// Set popup position
+	ImGui::SetNextWindowPos(cursorScreenPos);
+	
+	// Calculate popup size
+	float maxWidth = 200.0f;
+	float itemHeight = ImGui::GetTextLineHeightWithSpacing();
+	float maxHeight = std::min(10.0f, (float)mAutoCompleteSuggestions.size()) * itemHeight + 8.0f;
+	
+	ImGui::SetNextWindowSize(ImVec2(maxWidth, maxHeight));
+	
+	// Popup window flags
+	ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | 
+	                        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+	                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
+	
+	// Render popup
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
+	if (ImGui::Begin("##SQLAutoComplete", nullptr, flags))
+	{
+		for (int i = 0; i < (int)mAutoCompleteSuggestions.size(); i++)
+		{
+			bool isSelected = (i == mAutoCompleteSelectedIndex);
+			
+			if (ImGui::Selectable(mAutoCompleteSuggestions[i].c_str(), isSelected))
+			{
+				mAutoCompleteSelectedIndex = i;
+				AcceptAutoComplete();
+			}
+			
+			if (isSelected)
+			{
+				ImGui::SetItemDefaultFocus();
+				ImGui::SetScrollHereY();
+			}
+		}
+	}
+	ImGui::End();
+	ImGui::PopStyleVar();
+}
+
+void TextEditor::AcceptAutoComplete()
+{
+	if (!mShowAutoComplete || mAutoCompleteSelectedIndex < 0 || 
+	    mAutoCompleteSelectedIndex >= (int)mAutoCompleteSuggestions.size())
+		return;
+	
+	// Get the selected suggestion
+	const std::string& suggestion = mAutoCompleteSuggestions[mAutoCompleteSelectedIndex];
+	
+	// Delete the current partial word
+	DeleteRange(mAutoCompleteWordStart, mAutoCompleteWordEnd);
+	
+	// Insert the suggestion
+	auto pos = mAutoCompleteWordStart;
+	InsertTextAt(pos, (suggestion + " ").c_str());
+	
+	// Update cursor position
+	SetCursorPosition(pos);
+	
+	// Hide auto-complete
+	mShowAutoComplete = false;
+	mAutoCompleteSuggestions.clear();
+	mAutoCompleteSelectedIndex = -1;
+	
+	// Trigger colorization
+	Colorize(mAutoCompleteWordStart.mLine, 1);
+}

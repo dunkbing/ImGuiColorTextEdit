@@ -2,14 +2,12 @@
 
 #include <cmath>
 #include <cassert>
-#include <iostream>
 #include <string>
 #include <vector>
 #include <array>
 #include <memory>
 #include <unordered_set>
 #include <unordered_map>
-#include <map>
 #include "imgui.h"
 
 class IMGUI_API TextEditor
@@ -96,8 +94,6 @@ public:
 
 	void ImGuiDebugPanel(const std::string& panelName = "Debug");
 	void UnitTests();
-
-private:
 	// ------------- Generic utils ------------- //
 
 	static inline ImVec4 U32ColorToVec4(ImU32 in)
@@ -396,6 +392,13 @@ private:
 	void OnLineChanged(bool aBeforeChange, int aLine, int aColumn, int aCharCount, bool aDeleted);
 	void MergeCursorsIfPossible();
 
+	// Auto-complete
+	void UpdateAutoComplete();
+	void RenderAutoComplete();
+	void AcceptAutoComplete();
+	std::string GetWordAt(const Coordinates& aCoords) const;
+	std::string GetCurrentWord() const;
+
 	void AddUndo(UndoRecord& aValue);
 
 	void Colorize(int aFromLine = 0, int aCount = -1);
@@ -468,4 +471,11 @@ private:
 private:
     struct RegexList;
     std::shared_ptr<RegexList> mRegexList;
+
+    // Auto-complete members
+    bool mShowAutoComplete = false;
+    std::vector<std::string> mAutoCompleteSuggestions;
+    int mAutoCompleteSelectedIndex = -1;
+    Coordinates mAutoCompleteWordStart;
+    Coordinates mAutoCompleteWordEnd;
 };
