@@ -3097,26 +3097,33 @@ void TextEditor::RefreshFindResults(bool aPreserveSelection)
 	}
 	else
 	{
-		std::string searchText = joined;
-		std::string searchPattern = pattern;
+		const std::string* haystackPtr = &joined;
+		std::string loweredHaystack;
+		std::string loweredPattern;
+		const std::string* patternPtr = &pattern;
 		if (!caseSensitive)
 		{
-			std::transform(searchText.begin(), searchText.end(), searchText.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-			std::transform(searchPattern.begin(), searchPattern.end(), searchPattern.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+			loweredHaystack = joined;
+			std::transform(loweredHaystack.begin(), loweredHaystack.end(), loweredHaystack.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+			loweredPattern = pattern;
+			std::transform(loweredPattern.begin(), loweredPattern.end(), loweredPattern.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+			haystackPtr = &loweredHaystack;
+			patternPtr = &loweredPattern;
 		}
 
-		auto haystackBegin = searchText.begin();
-		auto searchBegin = haystackBegin + (std::ptrdiff_t)rangeStartOffset;
-		auto haystackEnd = haystackBegin + (std::ptrdiff_t)rangeEndOffset;
+		size_t patternLength = pattern.size();
+		if (patternLength == 0)
+			return;
 
-		while (searchBegin < haystackEnd)
+		size_t searchPos = rangeStartOffset;
+		while (searchPos < rangeEndOffset)
 		{
-			auto it = std::search(searchBegin, haystackEnd, searchPattern.begin(), searchPattern.end());
-			if (it == haystackEnd)
+			size_t found = haystackPtr->find(*patternPtr, searchPos);
+			if (found == std::string::npos || found >= rangeEndOffset)
 				break;
 
-			size_t matchStart = (size_t)std::distance(haystackBegin, it);
-			size_t matchEnd = matchStart + pattern.size();
+			size_t matchStart = found;
+			size_t matchEnd = matchStart + patternLength;
 
 			if (matchEnd > rangeEndOffset)
 				break;
@@ -3127,13 +3134,19 @@ void TextEditor::RefreshFindResults(bool aPreserveSelection)
 				bool boundaryAfter = (matchEnd >= rangeEndOffset) || (matchEnd >= joined.size()) || !CharIsWordChar(joined[matchEnd]);
 				if (!boundaryBefore || !boundaryAfter)
 				{
-					searchBegin = it + 1;
+					searchPos = matchStart + 1;
 					continue;
 				}
 			}
 
 			addResult(matchStart, matchEnd);
-			searchBegin = it + 1;
+			if (matchEnd <= matchStart)
+			{
+				// safety net against zero-length advances
+				searchPos = matchStart + 1;
+			}
+			else
+				searchPos = matchEnd;
 		}
 	}
 
