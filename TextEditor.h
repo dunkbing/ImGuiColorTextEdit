@@ -149,6 +149,14 @@ public:
 		Max
 	};
 
+	struct LineHighlight
+	{
+		int mStartColumn = 0;
+		int mEndColumn = 0;
+		bool mExtendsPastLine = false;
+		int mResultIndex = -1;
+	};
+
 	// Represents a character coordinate from the user's point of view,
 	// i. e. consider an uniform grid (assuming fixed-width font) on the
 	// screen as it is rendered, and each cell has its own coordinate, starting from 0.
@@ -387,6 +395,21 @@ public:
 	void HandleMouseInputs();
 	void UpdateViewVariables(float aScrollX, float aScrollY);
 	void Render(bool aParentIsFocused = false);
+	// struct LineHighlight;
+	void RenderFindReplacePanel(const ImVec2& aOrigin, const ImVec2& aSize, bool aParentIsFocused);
+
+	void RefreshFindResults(bool aPreserveSelection = true);
+	bool FocusFindResult(int aIndex, bool aCenterView = true);
+	bool HasValidFindPattern() const;
+	void FindNext(bool aBackwards = false);
+	void ReplaceCurrent();
+	int ReplaceAll();
+	bool IsWholeWordMatch(const Coordinates& aStart, const Coordinates& aEnd) const;
+	Coordinates AdvanceCoordinates(const Coordinates& aCoords) const;
+	const std::vector<LineHighlight>* GetFindHighlightsForLine(int aLineNumber) const;
+	void EnsureFindResultsUpToDate();
+	bool TryGetSelectionBounds(Coordinates& outStart, Coordinates& outEnd) const;
+	void MarkFindResultsDirty(bool deferRefresh = false);
 
 	void OnCursorPositionChanged();
 	void OnLineChanged(bool aBeforeChange, int aLine, int aColumn, int aCharCount, bool aDeleted);
@@ -470,14 +493,47 @@ public:
 	static PaletteId defaultPalette;
 
 private:
-    struct RegexList;
-    std::shared_ptr<RegexList> mRegexList;
+	struct RegexList;
+	std::shared_ptr<RegexList> mRegexList;
 
-    // Auto-complete members
-    bool mShowAutoComplete = false;
-    std::vector<std::string> mAutoCompleteSuggestions;
-    int mAutoCompleteSelectedIndex = -1;
-    Coordinates mAutoCompleteWordStart;
-    Coordinates mAutoCompleteWordEnd;
-    std::vector<std::string> mExtraKeywords;
+	struct SearchResult
+	{
+		Coordinates mStart;
+		Coordinates mEnd;
+	};
+
+
+
+	// Auto-complete members
+	bool mShowAutoComplete = false;
+	std::vector<std::string> mAutoCompleteSuggestions;
+	int mAutoCompleteSelectedIndex = -1;
+	Coordinates mAutoCompleteWordStart;
+	Coordinates mAutoCompleteWordEnd;
+	std::vector<std::string> mExtraKeywords;
+
+	// Find & replace members
+	bool mShowFindPanel = false;
+	bool mFindFocusRequested = false;
+	bool mReplaceFocusRequested = false;
+	bool mFindCaseSensitive = false;
+	bool mFindWholeWord = false;
+	bool mFindUseRegex = false;
+	bool mFindWrapAround = true;
+	bool mFindSelectionOnly = false;
+	bool mFindResultsDirty = true;
+	int mFindResultIndex = -1;
+	int mFindLastUndoIndex = -1;
+	int mFindLastUndoBufferSize = -1;
+	char mFindBuffer[256];
+	char mReplaceBuffer[256];
+	std::vector<SearchResult> mFindResults;
+	std::unordered_map<int, std::vector<LineHighlight>> mFindHighlightsCache;
+	std::string mFindStatusMessage;
+	float mFindStatusTimer = 0.0f;
+	bool mFindSelectionRangeValid = false;
+	Coordinates mFindSelectionRangeStart;
+	Coordinates mFindSelectionRangeEnd;
+	bool mFindRefreshPending = false;
+	float mFindRefreshTimer = 0.0f;
 };

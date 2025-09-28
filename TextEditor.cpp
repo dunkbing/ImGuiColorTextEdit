@@ -1,6 +1,10 @@
 #include <algorithm>
 #include <string>
 #include <set>
+#include <cstring>
+#include <cctype>
+#include <cfloat>
+#include <regex>
 #include <boost/regex.hpp>
 
 #include "TextEditor.h"
@@ -9,6 +13,11 @@
 #define POS_TO_COORDS_COLUMN_OFFSET 0.33f
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h" // for imGui::GetCurrentWindow()
+
+namespace
+{
+	constexpr float FIND_REFRESH_DEFER_SECONDS = 0.12f;
+}
 
 
 struct TextEditor::RegexList {
@@ -24,6 +33,10 @@ TextEditor::TextEditor()
 {
 	SetPalette(defaultPalette);
 	mLines.push_back(Line());
+	std::memset(mFindBuffer, 0, sizeof(mFindBuffer));
+	std::memset(mReplaceBuffer, 0, sizeof(mReplaceBuffer));
+	mFindRefreshPending = false;
+	mFindRefreshTimer = 0.0f;
 }
 
 TextEditor::~TextEditor()
@@ -178,6 +191,62 @@ bool TextEditor::AllCursorsHaveSelection() const
 		if (!mState.mCursors[c].HasSelection())
 			return false;
 	return true;
+}
+
+bool TextEditor::TryGetSelectionBounds(Coordinates& outStart, Coordinates& outEnd) const
+{
+	bool hasBounds = false;
+	for (int c = 0; c <= mState.mCurrentCursor; ++c)
+	{
+		if (!mState.mCursors[c].HasSelection())
+			continue;
+
+		Coordinates selectionStart = mState.mCursors[c].GetSelectionStart();
+		Coordinates selectionEnd = mState.mCursors[c].GetSelectionEnd();
+		if (selectionEnd < selectionStart)
+			std::swap(selectionStart, selectionEnd);
+
+		selectionStart = SanitizeCoordinates(selectionStart);
+		selectionEnd = SanitizeCoordinates(selectionEnd);
+
+		if (!hasBounds || selectionStart < outStart)
+			outStart = selectionStart;
+		if (!hasBounds || outEnd < selectionEnd)
+			outEnd = selectionEnd;
+		hasBounds = true;
+	}
+
+	if (!hasBounds && mFindSelectionRangeValid)
+	{
+		Coordinates start = SanitizeCoordinates(mFindSelectionRangeStart);
+		Coordinates end = SanitizeCoordinates(mFindSelectionRangeEnd);
+		if (start < end)
+		{
+			outStart = start;
+			outEnd = end;
+			return true;
+		}
+	}
+
+	if (!hasBounds || !(outStart < outEnd))
+		return false;
+
+	return true;
+}
+
+void TextEditor::MarkFindResultsDirty(bool deferRefresh)
+{
+	mFindResultsDirty = true;
+	if (deferRefresh)
+	{
+		mFindRefreshPending = true;
+		mFindRefreshTimer = FIND_REFRESH_DEFER_SECONDS;
+	}
+	else
+	{
+		mFindRefreshPending = false;
+		mFindRefreshTimer = 0.0f;
+	}
 }
 
 void TextEditor::ClearExtraCursors()
@@ -357,6 +426,9 @@ void TextEditor::SetText(const std::string& aText)
 	mUndoIndex = 0;
 
 	Colorize();
+	MarkFindResultsDirty(false);
+	mFindResultIndex = -1;
+	mFindHighlightsCache.clear();
 }
 
 std::string TextEditor::GetText() const
@@ -394,6 +466,9 @@ void TextEditor::SetTextLines(const std::vector<std::string>& aLines)
 	mUndoIndex = 0;
 
 	Colorize();
+	MarkFindResultsDirty(false);
+	mFindResultIndex = -1;
+	mFindHighlightsCache.clear();
 }
 
 std::vector<std::string> TextEditor::GetTextLines() const
@@ -435,6 +510,10 @@ bool TextEditor::Render(const char* aTitle, bool aParentIsFocused, const ImVec2&
 	Render(aParentIsFocused);
 
 	ImGui::EndChild();
+
+	ImVec2 panelMin = ImGui::GetItemRectMin();
+	ImVec2 panelMax = ImGui::GetItemRectMax();
+	RenderFindReplacePanel(panelMin, ImVec2(panelMax.x - panelMin.x, panelMax.y - panelMin.y), isFocused || aParentIsFocused);
 	
 	// Render auto-complete popup for SQL
 	if (mLanguageDefinitionId == LanguageDefinitionId::Sql)
@@ -678,6 +757,9 @@ std::string TextEditor::GetSelectedText(int aCursor) const
 	if (aCursor == -1)
 		aCursor = mState.mCurrentCursor;
 
+	if (!mState.mCursors[aCursor].HasSelection())
+		return "";
+
 	return GetText(mState.mCursors[aCursor].GetSelectionStart(), mState.mCursors[aCursor].GetSelectionEnd());
 }
 
@@ -699,6 +781,8 @@ void TextEditor::SetCursorPosition(const Coordinates& aPosition, int aCursor, bo
 int TextEditor::InsertTextAt(Coordinates& /* inout */ aWhere, const char* aValue)
 {
 	assert(!mReadOnly);
+	MarkFindResultsDirty(true);
+	mFindHighlightsCache.clear();
 
 	int cindex = GetCharacterIndexR(aWhere);
 	int totalLines = 0;
@@ -1185,6 +1269,10 @@ bool TextEditor::FindNextOccurrence(const char* aText, int aTextSize, const Coor
 
 	ifline = fline = aFrom.mLine;
 	ifindex = findex = GetCharacterIndexR(aFrom);
+	
+	// Track if we've started from the beginning (used to prevent wrapping in linear search)
+	bool startedFromBeginning = (ifline == 0 && ifindex == 0);
+	bool hasProcessedStart = false;
 
 	while (true)
 	{
@@ -1231,6 +1319,11 @@ bool TextEditor::FindNextOccurrence(const char* aText, int aTextSize, const Coor
 		{
 			if (fline == mLines.size() - 1)
 			{
+				// If we started from beginning, don't wrap (linear search for all occurrences)
+				if (startedFromBeginning)
+					return false;
+				
+				// For non-linear search (Find Next), wrap around once
 				fline = 0;
 				findex = 0;
 			}
@@ -1243,9 +1336,18 @@ bool TextEditor::FindNextOccurrence(const char* aText, int aTextSize, const Coor
 		else
 			findex++;
 
-		// detect complete scan
-		if (findex == ifindex && fline == ifline)
-			return false;
+		// For wrapped search, detect when we've completed the scan
+		if (!startedFromBeginning)
+		{
+			// Mark that we've processed the starting position
+			if (fline == ifline && findex == ifindex)
+				hasProcessedStart = true;
+			
+			// If we've wrapped and reached or passed the start position after processing it once
+			if (hasProcessedStart && ((fline == ifline && findex == ifindex) || 
+			    (fline == 0 && findex == 0 && ifline == 0 && ifindex == 0)))
+				return false;
+		}
 	}
 
 	return false;
@@ -1860,6 +1962,8 @@ void TextEditor::DeleteRange(const Coordinates& aStart, const Coordinates& aEnd)
 {
 	assert(aEnd >= aStart);
 	assert(!mReadOnly);
+	MarkFindResultsDirty(true);
+	mFindHighlightsCache.clear();
 
 	if (aEnd == aStart)
 		return;
@@ -1994,8 +2098,55 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 		auto isCtrlOnly = ctrl && !alt && !shift && !super;
 		auto isShiftOnly = shift && !alt && !ctrl && !super;
 
-		io.WantCaptureKeyboard = true;
-		io.WantTextInput = true;
+		// Don't process keyboard input if another ImGui item (like Find panel inputs) is active
+		bool shouldProcessInput = !ImGui::IsAnyItemActive();
+		
+		if (shouldProcessInput)
+		{
+			io.WantCaptureKeyboard = true;
+			io.WantTextInput = true;
+		}
+		
+		// Allow Escape key to close find panel even when its inputs are active
+		if (mShowFindPanel && ImGui::IsKeyPressed(ImGuiKey_Escape))
+		{
+			mShowFindPanel = false;
+			return;
+		}
+
+		// Allow shortcuts to open find panel even when other items are active
+		if (isShortcut && ImGui::IsKeyPressed(ImGuiKey_F))
+		{
+			std::string selection = GetSelectedText();
+				if (!selection.empty())
+				{
+					size_t maxCopy = sizeof(mFindBuffer) - 1;
+					std::strncpy(mFindBuffer, selection.c_str(), maxCopy);
+					mFindBuffer[maxCopy] = '\0';
+					MarkFindResultsDirty(false);
+				}
+				mShowFindPanel = true;
+			mFindFocusRequested = true;
+			mReplaceFocusRequested = false;
+			EnsureFindResultsUpToDate();
+			return;
+		}
+
+		if (isShortcut && ImGui::IsKeyPressed(ImGuiKey_H))
+		{
+			if (!mShowFindPanel)
+			{
+				mShowFindPanel = true;
+				mFindFocusRequested = true;
+			}
+			mReplaceFocusRequested = true;
+			EnsureFindResultsUpToDate();
+			return;
+		}
+
+		// Only process other keyboard input if no ImGui item is active
+		if (!shouldProcessInput)
+			return;
 		
 		// Handle auto-complete navigation
 		if (mShowAutoComplete && mLanguageDefinitionId == LanguageDefinitionId::Sql)
@@ -2023,6 +2174,12 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 				AcceptAutoComplete();
 				return;
 			}
+		}
+
+		if (ImGui::IsKeyPressed(ImGuiKey_F3))
+		{
+			FindNext(io.KeyShift);
+			return;
 		}
 
 		if (!mReadOnly && isShortcut && ImGui::IsKeyPressed(ImGuiKey_Z))
@@ -2268,6 +2425,7 @@ void TextEditor::UpdateViewVariables(float aScrollX, float aScrollY)
 
 void TextEditor::Render(bool aParentIsFocused)
 {
+	ImGuiIO& io = ImGui::GetIO();
 	/* Compute mCharAdvance regarding to scaled font size (Ctrl + mouse wheel)*/
 	const float fontWidth = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, "#", nullptr, nullptr).x;
 	const float fontHeight = ImGui::GetTextLineHeightWithSpacing();
@@ -2286,6 +2444,38 @@ void TextEditor::Render(bool aParentIsFocused)
 	mScrollX = ImGui::GetScrollX();
 	mScrollY = ImGui::GetScrollY();
 	UpdateViewVariables(mScrollX, mScrollY);
+	bool findResultsUpdatedThisFrame = false;
+	if (mFindRefreshPending)
+	{
+		mFindRefreshTimer = std::max(0.0f, mFindRefreshTimer - io.DeltaTime);
+		if (mFindRefreshTimer <= 0.0f)
+		{
+			mFindRefreshPending = false;
+			mFindRefreshTimer = 0.0f;
+			EnsureFindResultsUpToDate();
+			findResultsUpdatedThisFrame = true;
+		}
+	}
+
+	if (!mFindRefreshPending && !findResultsUpdatedThisFrame)
+	{
+		mFindRefreshTimer = 0.0f;
+		EnsureFindResultsUpToDate();
+		findResultsUpdatedThisFrame = true;
+	}
+	bool drawFindHighlights = HasValidFindPattern() && !mFindResults.empty();
+	ImU32 findHighlightColor = 0;
+	ImU32 findHighlightActiveColor = 0;
+	if (drawFindHighlights)
+	{
+		ImVec4 baseColor = U32ColorToVec4(mPalette[(int)PaletteIndex::Selection]);
+		ImVec4 inactiveColor = baseColor;
+		inactiveColor.w *= 0.35f;
+		findHighlightColor = ImGui::ColorConvertFloat4ToU32(inactiveColor);
+		ImVec4 activeColor = baseColor;
+		activeColor.w *= 0.65f;
+		findHighlightActiveColor = ImGui::ColorConvertFloat4ToU32(activeColor);
+	}
 
 	int maxColumnLimited = 0;
 	if (!mLines.empty())
@@ -2303,6 +2493,29 @@ void TextEditor::Render(bool aParentIsFocused)
 
 			Coordinates lineStartCoord(lineNo, 0);
 			Coordinates lineEndCoord(lineNo, maxColumnLimited);
+
+			if (drawFindHighlights)
+			{
+				const auto* segments = GetFindHighlightsForLine(lineNo);
+				if (segments != nullptr)
+				{
+					for (const auto& segment : *segments)
+					{
+						Coordinates segmentStart(lineNo, segment.mStartColumn);
+						Coordinates segmentEnd(lineNo, segment.mEndColumn);
+						float rectStart = TextDistanceToLineStart(segmentStart, false);
+						float rectEnd = TextDistanceToLineStart(segmentEnd, false);
+						if (segment.mExtendsPastLine)
+							rectEnd += mCharAdvance.x;
+						bool isActiveSegment = segment.mResultIndex == mFindResultIndex;
+						ImU32 color = isActiveSegment ? findHighlightActiveColor : findHighlightColor;
+						drawList->AddRectFilled(
+							ImVec2{ lineStartScreenPos.x + mTextStart + rectStart, lineStartScreenPos.y },
+							ImVec2{ lineStartScreenPos.x + mTextStart + rectEnd, lineStartScreenPos.y + mCharAdvance.y },
+							color, 2.5f);
+					}
+				}
+			}
 
 			// Draw selection for the current line
 			for (int c = 0; c <= mState.mCurrentCursor; c++)
@@ -2594,6 +2807,601 @@ void TextEditor::AddUndo(UndoRecord& aValue)
 	mUndoBuffer.resize((size_t)(mUndoIndex + 1));
 	mUndoBuffer.back() = aValue;
 	++mUndoIndex;
+}
+
+bool TextEditor::HasValidFindPattern() const
+{
+	return mFindBuffer[0] != '\0';
+}
+
+const std::vector<TextEditor::LineHighlight>* TextEditor::GetFindHighlightsForLine(int aLineNumber) const
+{
+	if (!HasValidFindPattern())
+		return nullptr;
+	auto it = mFindHighlightsCache.find(aLineNumber);
+	return it != mFindHighlightsCache.end() ? &it->second : nullptr;
+}
+
+TextEditor::Coordinates TextEditor::AdvanceCoordinates(const Coordinates& aCoords) const
+{
+	Coordinates sanitized = SanitizeCoordinates(aCoords);
+	int totalLines = static_cast<int>(mLines.size());
+	if (sanitized.mLine < 0 || sanitized.mLine >= totalLines)
+		return Coordinates(totalLines, 0);
+
+	int line = sanitized.mLine;
+	int charIndex = GetCharacterIndexR(sanitized);
+	if (charIndex < 0)
+		charIndex = 0;
+
+	if (!Move(line, charIndex))
+	{
+		// Move failed only when we're at the logical end of the buffer; return a sentinel past-the-end position
+		return Coordinates(totalLines, 0);
+	}
+
+	return Coordinates(line, GetCharacterColumn(line, charIndex));
+}
+
+bool TextEditor::IsWholeWordMatch(const Coordinates& aStart, const Coordinates& aEnd) const
+{
+	Coordinates start = SanitizeCoordinates(aStart);
+	Coordinates end = SanitizeCoordinates(aEnd);
+	int startLine = start.mLine;
+	if (startLine < 0 || startLine >= (int)mLines.size())
+		return false;
+	int startCharIndex = GetCharacterIndexR(start);
+	bool boundaryBefore = true;
+	if (startCharIndex > 0)
+	{
+		int prevIndex = startCharIndex - 1;
+		while (prevIndex > 0 && IsUTFSequence(mLines[startLine][prevIndex].mChar))
+			--prevIndex;
+		if (prevIndex >= 0 && prevIndex < (int)mLines[startLine].size())
+		{
+			char prevChar = mLines[startLine][prevIndex].mChar;
+			boundaryBefore = !CharIsWordChar(prevChar);
+		}
+	}
+
+	int endLine = end.mLine;
+	if (endLine < 0 || endLine >= (int)mLines.size())
+		return false;
+	int endCharIndex = GetCharacterIndexR(end);
+	bool boundaryAfter = true;
+	if (endCharIndex < (int)mLines[endLine].size())
+	{
+		char nextChar = mLines[endLine][endCharIndex].mChar;
+		boundaryAfter = !CharIsWordChar(nextChar);
+	}
+
+	return boundaryBefore && boundaryAfter;
+}
+
+void TextEditor::EnsureFindResultsUpToDate()
+{
+	if (!HasValidFindPattern())
+	{
+		if (!mFindResults.empty())
+		{
+			mFindResults.clear();
+			mFindHighlightsCache.clear();
+			mFindResultIndex = -1;
+		}
+		mFindResultsDirty = false;
+		return;
+	}
+
+	int undoSize = (int)mUndoBuffer.size();
+	if (mFindResultsDirty || mFindLastUndoIndex != mUndoIndex || mFindLastUndoBufferSize != undoSize)
+		RefreshFindResults();
+}
+
+void TextEditor::RefreshFindResults(bool aPreserveSelection)
+{
+	mFindResultsDirty = false;
+	mFindRefreshPending = false;
+	mFindRefreshTimer = 0.0f;
+	mFindLastUndoIndex = mUndoIndex;
+	mFindLastUndoBufferSize = (int)mUndoBuffer.size();
+	mFindResults.clear();
+	mFindHighlightsCache.clear();
+	mFindResultIndex = -1;
+
+	if (!HasValidFindPattern() || mLines.empty())
+		return;
+
+	std::string pattern(mFindBuffer);
+	if (pattern.empty())
+		return;
+
+	bool caseSensitive = mFindCaseSensitive;
+	bool wholeWord = mFindWholeWord && !mFindUseRegex;
+	bool useRegex = mFindUseRegex;
+
+	std::vector<std::string> lineStrings;
+	std::vector<size_t> lineOffsets;
+	lineStrings.reserve(mLines.size());
+	lineOffsets.reserve(mLines.size());
+
+	size_t totalLength = 0;
+	for (size_t i = 0; i < mLines.size(); ++i)
+	{
+		lineOffsets.push_back(totalLength);
+		const auto& line = mLines[i];
+		std::string lineText;
+		lineText.reserve(line.size());
+		for (const auto& glyph : line)
+			lineText.push_back(glyph.mChar);
+		totalLength += lineText.size();
+		if (i + 1 < mLines.size())
+			totalLength += 1;
+		lineStrings.emplace_back(std::move(lineText));
+	}
+
+	std::string joined;
+	joined.reserve(totalLength);
+	for (size_t i = 0; i < lineStrings.size(); ++i)
+	{
+		joined.append(lineStrings[i]);
+		if (i + 1 < lineStrings.size())
+			joined.push_back('\n');
+	}
+
+	auto coordinateToOffset = [&](const Coordinates& coords) -> size_t
+	{
+		Coordinates sanitized = SanitizeCoordinates(coords);
+		int line = std::clamp(sanitized.mLine, 0, (int)mLines.size() - 1);
+		sanitized.mLine = line;
+		int charIndex = GetCharacterIndexR(sanitized);
+		charIndex = std::clamp(charIndex, 0, (int)mLines[line].size());
+		size_t base = lineOffsets[line];
+		return base + static_cast<size_t>(charIndex);
+	};
+
+	auto offsetToCoordinates = [&](size_t offset) -> Coordinates
+	{
+		if (lineOffsets.empty())
+			return Coordinates(0, 0);
+		if (offset > joined.size())
+			offset = joined.size();
+
+		auto it = std::upper_bound(lineOffsets.begin(), lineOffsets.end(), offset);
+		int line = (int)std::distance(lineOffsets.begin(), it) - 1;
+		if (line < 0)
+			line = 0;
+		if (line >= (int)lineOffsets.size())
+			line = (int)lineOffsets.size() - 1;
+
+		size_t lineOffset = lineOffsets[line];
+		size_t charIndex = offset - lineOffset;
+		if (charIndex > lineStrings[line].size())
+			charIndex = lineStrings[line].size();
+		int column = GetCharacterColumn(line, (int)charIndex);
+		return Coordinates(line, column);
+	};
+
+	Coordinates selectionStartCoords;
+	Coordinates selectionEndCoords;
+	bool selectionRangeValid = false;
+	if (mFindSelectionOnly)
+	{
+		if (TryGetSelectionBounds(selectionStartCoords, selectionEndCoords))
+		{
+			selectionRangeValid = true;
+		}
+		else if (mFindSelectionRangeValid)
+		{
+			selectionRangeValid = true;
+			selectionStartCoords = mFindSelectionRangeStart;
+			selectionEndCoords = mFindSelectionRangeEnd;
+		}
+		if (selectionRangeValid)
+		{
+			selectionStartCoords = SanitizeCoordinates(selectionStartCoords);
+			selectionEndCoords = SanitizeCoordinates(selectionEndCoords);
+			mFindSelectionRangeStart = selectionStartCoords;
+			mFindSelectionRangeEnd = selectionEndCoords;
+		}
+	}
+
+	mFindSelectionRangeValid = selectionRangeValid;
+	if (!selectionRangeValid)
+	{
+		selectionStartCoords = Coordinates(0, 0);
+		selectionEndCoords = Coordinates((int)mLines.size() - 1, GetLineMaxColumn((int)mLines.size() - 1));
+		selectionStartCoords = SanitizeCoordinates(selectionStartCoords);
+		selectionEndCoords = SanitizeCoordinates(selectionEndCoords);
+	}
+
+	size_t rangeStartOffset = coordinateToOffset(selectionStartCoords);
+	size_t rangeEndOffset = coordinateToOffset(selectionEndCoords);
+	rangeEndOffset = std::min(rangeEndOffset, joined.size());
+	if (rangeStartOffset > rangeEndOffset)
+		std::swap(rangeStartOffset, rangeEndOffset);
+
+	Coordinates preservedSelectionStart;
+	Coordinates preservedSelectionEnd;
+	bool preservedSelectionValid = false;
+	if (aPreserveSelection && AnyCursorHasSelection())
+	{
+		int cursorIndex = mState.GetLastAddedCursorIndex();
+		preservedSelectionStart = mState.mCursors[cursorIndex].GetSelectionStart();
+		preservedSelectionEnd = mState.mCursors[cursorIndex].GetSelectionEnd();
+		preservedSelectionValid = true;
+	}
+
+	auto addResult = [&](size_t startOffset, size_t endOffset)
+	{
+		if (startOffset >= endOffset)
+			return;
+		Coordinates startCoord = offsetToCoordinates(startOffset);
+		Coordinates endCoord = offsetToCoordinates(endOffset);
+		SearchResult result{ startCoord, endCoord };
+		mFindResults.push_back(result);
+		int resultIndex = (int)mFindResults.size() - 1;
+		int startLine = result.mStart.mLine;
+		int endLine = result.mEnd.mLine;
+		if (startLine == endLine)
+		{
+			mFindHighlightsCache[startLine].push_back({ result.mStart.mColumn, result.mEnd.mColumn, false, resultIndex });
+		}
+		else
+		{
+			mFindHighlightsCache[startLine].push_back({ result.mStart.mColumn, GetLineMaxColumn(startLine), true, resultIndex });
+			for (int line = startLine + 1; line < endLine; ++line)
+			{
+				mFindHighlightsCache[line].push_back({ 0, GetLineMaxColumn(line), true, resultIndex });
+			}
+			mFindHighlightsCache[endLine].push_back({ 0, result.mEnd.mColumn, false, resultIndex });
+		}
+	};
+
+	if (useRegex)
+	{
+		try
+		{
+			std::regex_constants::syntax_option_type options = std::regex_constants::ECMAScript | std::regex_constants::optimize;
+			if (!caseSensitive)
+				options |= std::regex_constants::icase;
+			std::regex re(pattern, options);
+
+			auto beginIt = joined.begin() + (std::ptrdiff_t)rangeStartOffset;
+			auto endIt = joined.begin() + (std::ptrdiff_t)rangeEndOffset;
+
+			for (auto it = std::sregex_iterator(beginIt, endIt, re); it != std::sregex_iterator(); ++it)
+			{
+				size_t relativeStart = static_cast<size_t>(it->position());
+				size_t matchLength = static_cast<size_t>(it->length());
+				if (matchLength == 0)
+					continue;
+
+				size_t matchStart = rangeStartOffset + relativeStart;
+				size_t matchEnd = matchStart + matchLength;
+				if (wholeWord)
+				{
+					bool boundaryBefore = (matchStart == rangeStartOffset) || (matchStart == 0) || !CharIsWordChar(joined[matchStart - 1]);
+					bool boundaryAfter = (matchEnd >= rangeEndOffset) || (matchEnd >= joined.size()) || !CharIsWordChar(joined[matchEnd]);
+					if (!boundaryBefore || !boundaryAfter)
+						continue;
+				}
+				addResult(matchStart, matchEnd);
+			}
+		}
+		catch (const std::regex_error&)
+		{
+			mFindStatusMessage = "Invalid regex";
+			mFindStatusTimer = 3.0f;
+			return;
+		}
+	}
+	else
+	{
+		std::string searchText = joined;
+		std::string searchPattern = pattern;
+		if (!caseSensitive)
+		{
+			std::transform(searchText.begin(), searchText.end(), searchText.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+			std::transform(searchPattern.begin(), searchPattern.end(), searchPattern.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+		}
+
+		auto haystackBegin = searchText.begin();
+		auto searchBegin = haystackBegin + (std::ptrdiff_t)rangeStartOffset;
+		auto haystackEnd = haystackBegin + (std::ptrdiff_t)rangeEndOffset;
+
+		while (searchBegin < haystackEnd)
+		{
+			auto it = std::search(searchBegin, haystackEnd, searchPattern.begin(), searchPattern.end());
+			if (it == haystackEnd)
+				break;
+
+			size_t matchStart = (size_t)std::distance(haystackBegin, it);
+			size_t matchEnd = matchStart + pattern.size();
+
+			if (matchEnd > rangeEndOffset)
+				break;
+
+			if (wholeWord)
+			{
+				bool boundaryBefore = (matchStart == rangeStartOffset) || (matchStart == 0) || !CharIsWordChar(joined[matchStart - 1]);
+				bool boundaryAfter = (matchEnd >= rangeEndOffset) || (matchEnd >= joined.size()) || !CharIsWordChar(joined[matchEnd]);
+				if (!boundaryBefore || !boundaryAfter)
+				{
+					searchBegin = it + 1;
+					continue;
+				}
+			}
+
+			addResult(matchStart, matchEnd);
+			searchBegin = it + 1;
+		}
+	}
+
+	if (mFindResults.empty())
+		return;
+
+	Coordinates cursorCoords = GetSanitizedCursorCoordinates();
+	size_t cursorOffset = coordinateToOffset(cursorCoords);
+	int chosenIndex = -1;
+
+	if (aPreserveSelection && preservedSelectionValid)
+	{
+		size_t preservedStart = coordinateToOffset(preservedSelectionStart);
+		size_t preservedEnd = coordinateToOffset(preservedSelectionEnd);
+		for (int i = 0; i < (int)mFindResults.size(); ++i)
+		{
+			const auto& res = mFindResults[i];
+			size_t resStart = coordinateToOffset(res.mStart);
+			size_t resEnd = coordinateToOffset(res.mEnd);
+			if (resStart == preservedStart && resEnd == preservedEnd)
+			{
+				chosenIndex = i;
+				break;
+			}
+		}
+	}
+
+	if (chosenIndex == -1)
+	{
+		for (int i = 0; i < (int)mFindResults.size(); ++i)
+		{
+			const auto& res = mFindResults[i];
+			size_t resStart = coordinateToOffset(res.mStart);
+			size_t resEnd = coordinateToOffset(res.mEnd);
+			if (resStart <= cursorOffset && cursorOffset < resEnd)
+			{
+				chosenIndex = i;
+				break;
+			}
+			if (cursorOffset < resStart)
+			{
+				chosenIndex = i;
+				break;
+			}
+		}
+	}
+
+	if (chosenIndex == -1)
+		chosenIndex = 0;
+
+	mFindResultIndex = chosenIndex;
+}
+
+bool TextEditor::FocusFindResult(int aIndex, bool aCenterView)
+{
+	EnsureFindResultsUpToDate();
+	if (mFindResults.empty())
+		return false;
+	int count = (int)mFindResults.size();
+	int idx = aIndex;
+	if (idx < 0)
+	{
+		idx = (idx % count + count) % count;
+	}
+	else
+		idx = idx % count;
+	mFindResultIndex = idx;
+
+	const auto& res = mFindResults[mFindResultIndex];
+	ClearSelections();
+	ClearExtraCursors();
+	SetSelection(res.mStart, res.mEnd);
+	if (aCenterView)
+		EnsureCursorVisible(-1, true);
+	return true;
+}
+
+void TextEditor::FindNext(bool aBackwards)
+{
+	EnsureFindResultsUpToDate();
+	if (mFindResults.empty())
+	{
+		mFindStatusMessage = "No matches";
+		mFindStatusTimer = 2.5f;
+		return;
+	}
+	int count = (int)mFindResults.size();
+	int idx = mFindResultIndex;
+	if (idx < 0)
+	{
+		idx = aBackwards ? count - 1 : 0;
+	}
+	else
+	{
+		int next = aBackwards ? idx - 1 : idx + 1;
+		if (!mFindWrapAround && (next < 0 || next >= count))
+		{
+			mFindStatusMessage = aBackwards ? "Reached start" : "Reached end";
+			mFindStatusTimer = 2.0f;
+			return;
+		}
+		idx = (next % count + count) % count;
+	}
+	FocusFindResult(idx);
+	mFindStatusMessage.clear();
+	mFindStatusTimer = 0.0f;
+}
+
+void TextEditor::ReplaceCurrent()
+{
+	if (!HasValidFindPattern())
+	{
+		mFindStatusMessage = "Nothing to replace";
+		mFindStatusTimer = 2.5f;
+		return;
+	}
+
+	EnsureFindResultsUpToDate();
+	if (mFindResults.empty())
+	{
+		mFindStatusMessage = "No matches";
+		mFindStatusTimer = 2.5f;
+		return;
+	}
+	if (mFindResultIndex < 0 || mFindResultIndex >= (int)mFindResults.size())
+		mFindResultIndex = 0;
+
+	const auto current = mFindResults[mFindResultIndex];
+	ClearSelections();
+	ClearExtraCursors();
+	SetSelection(current.mStart, current.mEnd);
+	InsertTextAtCursor(mReplaceBuffer);
+	if (mFindSelectionOnly)
+		mFindSelectionRangeValid = false;
+
+	MarkFindResultsDirty(false);
+	RefreshFindResults(false);
+	if (!mFindResults.empty())
+	{
+		Coordinates cursor = GetSanitizedCursorCoordinates();
+		int nextIndex = -1;
+		for (int i = 0; i < (int)mFindResults.size(); ++i)
+		{
+			const auto& res = mFindResults[i];
+			if (!(cursor < res.mStart) && cursor < res.mEnd)
+			{
+				nextIndex = i;
+				break;
+			}
+			if (!(res.mStart < cursor))
+			{
+				nextIndex = i;
+				break;
+			}
+		}
+		if (nextIndex == -1)
+			nextIndex = 0;
+		FocusFindResult(nextIndex);
+	}
+	else
+	{
+		mFindResultIndex = -1;
+		ClearSelections();
+		EnsureCursorVisible();
+	}
+
+	mFindStatusMessage = "Replaced";
+	mFindStatusTimer = 2.0f;
+}
+
+int TextEditor::ReplaceAll()
+{
+	if (!HasValidFindPattern())
+	{
+		mFindStatusMessage = "Nothing to replace";
+		mFindStatusTimer = 2.5f;
+		return 0;
+	}
+
+	EnsureFindResultsUpToDate();
+	if (mFindResults.empty())
+	{
+		mFindStatusMessage = "No matches";
+		mFindStatusTimer = 2.5f;
+		return 0;
+	}
+
+	Coordinates selectionStart;
+	Coordinates selectionEnd;
+	bool selectionRangeActive = false;
+	if (mFindSelectionOnly)
+	{
+		if (TryGetSelectionBounds(selectionStart, selectionEnd))
+		{
+			mFindSelectionRangeStart = selectionStart;
+			mFindSelectionRangeEnd = selectionEnd;
+			mFindSelectionRangeValid = true;
+		}
+		if (mFindSelectionRangeValid)
+		{
+			selectionStart = SanitizeCoordinates(mFindSelectionRangeStart);
+			selectionEnd = SanitizeCoordinates(mFindSelectionRangeEnd);
+			selectionRangeActive = true;
+		}
+	}
+
+	auto withinSelectionRange = [&](const SearchResult& res)
+	{
+		if (!selectionRangeActive)
+			return true;
+		return !(res.mStart < selectionStart) && !(selectionEnd < res.mEnd);
+	};
+
+	int replacements = 0;
+	Coordinates lastReplacementStart = Coordinates::Invalid();
+
+	while (true)
+	{
+		EnsureFindResultsUpToDate();
+		if (mFindResults.empty())
+			break;
+
+		int targetIndex = -1;
+		for (int i = 0; i < (int)mFindResults.size(); ++i)
+		{
+			if (withinSelectionRange(mFindResults[i]))
+			{
+				targetIndex = i;
+				break;
+			}
+		}
+		if (targetIndex == -1)
+			break;
+
+		const auto current = mFindResults[targetIndex];
+		if (lastReplacementStart == current.mStart)
+			break;
+		lastReplacementStart = current.mStart;
+
+		ClearSelections();
+		ClearExtraCursors();
+		SetSelection(current.mStart, current.mEnd);
+		InsertTextAtCursor(mReplaceBuffer);
+		++replacements;
+		if (selectionRangeActive)
+			mFindSelectionRangeValid = false;
+	}
+
+	RefreshFindResults(false);
+	if (!mFindResults.empty())
+		FocusFindResult(0, false);
+	else
+	{
+		mFindResultIndex = -1;
+		ClearSelections();
+		EnsureCursorVisible();
+	}
+
+	if (replacements == 0)
+	{
+		mFindStatusMessage = "No matches";
+		mFindStatusTimer = 2.5f;
+		return 0;
+	}
+
+	mFindStatusMessage = replacements == 1 ? "Replaced 1 match" : "Replaced " + std::to_string(replacements) + " matches";
+	mFindStatusTimer = 3.0f;
+	return replacements;
 }
 
 // TODO
@@ -3204,4 +4012,231 @@ void TextEditor::AcceptAutoComplete()
 	
 	// Trigger colorization
 	Colorize(mAutoCompleteWordStart.mLine, 1);
+}
+
+void TextEditor::RenderFindReplacePanel(const ImVec2& aOrigin, const ImVec2& aSize, bool /*aParentIsFocused*/)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	if (!mShowFindPanel)
+	{
+		if (mFindStatusTimer > 0.0f)
+		{
+			mFindStatusTimer = std::max(0.0f, mFindStatusTimer - io.DeltaTime);
+			if (mFindStatusTimer <= 0.0f)
+				mFindStatusMessage.clear();
+		}
+		return;
+	}
+
+	EnsureFindResultsUpToDate();
+
+	const float padding = 12.0f;
+	float panelWidth = std::min(420.0f, aSize.x - padding * 2.0f);
+	panelWidth = std::max(panelWidth, 260.0f);
+	ImVec2 panelPos(aOrigin.x + aSize.x - panelWidth - padding, aOrigin.y + padding);
+	panelPos.x = std::max(panelPos.x, aOrigin.x + padding);
+
+	ImGui::SetNextWindowPos(panelPos);
+	ImGui::SetNextWindowSize(ImVec2(panelWidth, 0.0f));
+	ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoResize |
+		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+		ImGuiWindowFlags_AlwaysAutoResize;
+
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+	ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(bg.x, bg.y, bg.z, bg.w * 0.98f));
+
+	if (ImGui::Begin("##TextEditorFindReplace", &mShowFindPanel, flags))
+	{
+		if (mFindStatusTimer > 0.0f)
+		{
+			mFindStatusTimer = std::max(0.0f, mFindStatusTimer - io.DeltaTime);
+			if (mFindStatusTimer <= 0.0f)
+				mFindStatusMessage.clear();
+		}
+
+		const ImGuiStyle& style = ImGui::GetStyle();
+		ImVec4 accent = style.Colors[ImGuiCol_ButtonHovered];
+		ImVec4 activeColor = ImVec4(accent.x, accent.y, accent.z, 0.85f);
+		ImVec4 inactiveColor = style.Colors[ImGuiCol_FrameBg];
+		ImVec4 inactiveHover = ImVec4(inactiveColor.x, inactiveColor.y, inactiveColor.z, inactiveColor.w + 0.1f);
+
+		int matchCount = (int)mFindResults.size();
+		int currentMatch = (matchCount > 0 && mFindResultIndex >= 0) ? (mFindResultIndex + 1) : 0;
+		bool hasPattern = HasValidFindPattern();
+
+		auto drawToggle = [&](const char* id, const char* label, bool* value, bool disabled, const char* tooltip) -> bool
+		{
+			bool changed = false;
+			ImGui::BeginDisabled(disabled);
+			ImGui::PushID(id);
+			ImGui::PushStyleColor(ImGuiCol_Button, *value ? activeColor : inactiveColor);
+			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, *value ? activeColor : inactiveHover);
+			ImGui::PushStyleColor(ImGuiCol_ButtonActive, *value ? activeColor : inactiveHover);
+			ImVec2 labelSize = ImGui::CalcTextSize(label);
+			float buttonWidth = labelSize.x + style.FramePadding.x * 2.0f;
+			if (ImGui::Button(label, ImVec2(buttonWidth, 0.0f)))
+			{
+				*value = !*value;
+				changed = true;
+			}
+			if (tooltip && ImGui::IsItemHovered())
+				ImGui::SetTooltip("%s", tooltip);
+			ImGui::PopStyleColor(3);
+			ImGui::PopID();
+			ImGui::EndDisabled();
+			return changed;
+		};
+
+		ImGui::PushID("FindReplaceModern");
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 6.0f));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 6.0f));
+
+		const ImGuiTableFlags tableFlags = ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX | ImGuiTableFlags_NoBordersInBody;
+		if (ImGui::BeginTable("FindHeader", 4, tableFlags))
+		{
+			ImGui::TableSetupColumn("Toggles", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+			ImGui::TableSetupColumn("SearchInput", ImGuiTableColumnFlags_WidthStretch);
+			ImGui::TableSetupColumn("Navigation", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+			ImGui::TableSetupColumn("Close", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+
+			ImGui::TableNextRow();
+
+			// Toggle cluster
+			ImGui::TableSetColumnIndex(0);
+			ImGui::BeginGroup();
+			if (drawToggle("match_case", "Aa", &mFindCaseSensitive, false, "Match case"))
+				MarkFindResultsDirty(false);
+			ImGui::SameLine();
+			bool wholeWordDisabled = mFindUseRegex;
+			if (drawToggle("whole_word", "wd", &mFindWholeWord, wholeWordDisabled, "Whole word"))
+				MarkFindResultsDirty(false);
+			if (wholeWordDisabled)
+				mFindWholeWord = false;
+			ImGui::SameLine();
+			bool regexChanged = drawToggle("use_regex", ".*", &mFindUseRegex, false, "Regular expression");
+			if (regexChanged)
+			{
+				MarkFindResultsDirty(false);
+				if (mFindUseRegex)
+					mFindWholeWord = false;
+			}
+			ImGui::EndGroup();
+
+			// Search input
+			ImGui::TableSetColumnIndex(1);
+			if (mFindFocusRequested)
+			{
+				ImGui::SetKeyboardFocusHere();
+				mFindFocusRequested = false;
+			}
+			ImGui::SetNextItemWidth(-FLT_MIN);
+			ImGuiInputTextFlags findFlags = ImGuiInputTextFlags_EnterReturnsTrue;
+			if (ImGui::InputTextWithHint("##FindInput", "Search...", mFindBuffer, IM_ARRAYSIZE(mFindBuffer), findFlags))
+				MarkFindResultsDirty(true);
+			if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Enter))
+				FindNext(io.KeyShift);
+
+			// Navigation controls
+			ImGui::TableSetColumnIndex(2);
+			ImGui::BeginDisabled(!hasPattern || matchCount == 0);
+			ImVec2 arrowSize(ImGui::GetFrameHeight(), ImGui::GetFrameHeight());
+			if (ImGui::Button("<", arrowSize))
+				FindNext(true);
+			ImGui::SameLine();
+			if (ImGui::Button(">", arrowSize))
+				FindNext(false);
+			ImGui::SameLine();
+			ImGui::Text("%d/%d", currentMatch, matchCount);
+			ImGui::EndDisabled();
+
+			// Close button
+			ImGui::TableSetColumnIndex(3);
+			if (ImGui::Button("x"))
+				mShowFindPanel = false;
+
+			ImGui::EndTable();
+		}
+
+		// Replace field
+		if (mReplaceFocusRequested)
+		{
+			ImGui::SetKeyboardFocusHere();
+			mReplaceFocusRequested = false;
+		}
+		ImGui::SetNextItemWidth(-FLT_MIN);
+		if (ImGui::InputTextWithHint("##ReplaceInput", "Replace with...", mReplaceBuffer, IM_ARRAYSIZE(mReplaceBuffer), ImGuiInputTextFlags_EnterReturnsTrue))
+		{
+			// no-op, buffer already updated
+		}
+		if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Enter))
+			ReplaceCurrent();
+
+		// Additional toggles row
+		ImGui::Spacing();
+		ImGui::BeginGroup();
+		bool wrapChanged = drawToggle("wrap_toggle", "Wrap", &mFindWrapAround, false, "Wrap search");
+		if (wrapChanged)
+			MarkFindResultsDirty(false);
+		ImGui::SameLine();
+		bool selectionChanged = drawToggle("selection_toggle", "Sel", &mFindSelectionOnly, false, "Limit search to selection");
+		if (selectionChanged)
+		{
+			if (mFindSelectionOnly)
+			{
+				Coordinates selStart;
+				Coordinates selEnd;
+				if (TryGetSelectionBounds(selStart, selEnd))
+				{
+					mFindSelectionRangeStart = selStart;
+					mFindSelectionRangeEnd = selEnd;
+					mFindSelectionRangeValid = true;
+				}
+				else
+				{
+					mFindSelectionOnly = false;
+					mFindSelectionRangeValid = false;
+					mFindStatusMessage = "Select text to limit search";
+					mFindStatusTimer = 2.0f;
+				}
+			}
+			else
+			{
+				mFindSelectionRangeValid = false;
+			}
+			MarkFindResultsDirty(false);
+		}
+		ImGui::EndGroup();
+
+		float replaceWidth = ImGui::CalcTextSize("Replace").x + style.FramePadding.x * 2.0f;
+		float replaceAllWidth = ImGui::CalcTextSize("Replace All").x + style.FramePadding.x * 2.0f;
+		float actionTotalWidth = replaceWidth + style.ItemSpacing.x + replaceAllWidth;
+		float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+		float actionStart = rightEdge - actionTotalWidth;
+		ImGui::SameLine(std::max(ImGui::GetCursorPosX(), actionStart));
+		ImGui::BeginDisabled(!hasPattern || matchCount == 0 || mReadOnly);
+				if (ImGui::Button("Replace"))
+				ReplaceCurrent();
+		ImGui::SameLine();
+		if (ImGui::Button("Replace All"))
+			ReplaceAll();
+		ImGui::EndDisabled();
+
+		ImGui::PopStyleVar(3);
+		ImGui::PopID();
+
+		if (!mFindStatusMessage.empty())
+		{
+			ImGui::Spacing();
+			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+			ImGui::TextUnformatted(mFindStatusMessage.c_str());
+			ImGui::PopStyleColor();
+		}
+	}
+	ImGui::End();
+	ImGui::PopStyleColor();
+	ImGui::PopStyleVar(3);
 }
