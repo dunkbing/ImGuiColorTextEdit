@@ -3855,25 +3855,6 @@ std::string TextEditor::GetWordAt(const Coordinates& aCoords) const
 
 void TextEditor::UpdateAutoComplete()
 {
-	// Common SQL keywords
-	static const std::vector<std::string> sqlKeywords = {
-		"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
-		"CREATE", "TABLE", "ALTER", "DROP", "INDEX", "VIEW", "DATABASE", "SCHEMA",
-		"JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "FULL", "CROSS", "ON", "USING",
-		"GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
-		"UNION", "ALL", "INTERSECT", "EXCEPT", "DISTINCT", "AS",
-		"AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "NULL",
-		"CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "CONVERT",
-		"COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND", "FLOOR", "CEIL", "ABS",
-		"LENGTH", "SUBSTRING", "CONCAT", "REPLACE", "TRIM", "UPPER", "LOWER",
-		"COALESCE", "NULLIF", "NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
-		"PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "CHECK", "DEFAULT",
-		"CASCADE", "RESTRICT", "NO", "ACTION", "CONSTRAINT", "AUTO_INCREMENT",
-		"BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "SAVEPOINT",
-		"GRANT", "REVOKE", "PRIVILEGES", "TO", "PUBLIC", "WITH", "OPTION",
-		"TRIGGER", "BEFORE", "AFTER", "EACH", "ROW", "FOR", "PROCEDURE", "FUNCTION", "RETURN"
-	};
-	
 	// Get current cursor position and word
 	auto coords = GetSanitizedCursorCoordinates();
 	if (coords.mLine >= (int)mLines.size())
@@ -3905,19 +3886,31 @@ void TextEditor::UpdateAutoComplete()
 		return;
 	}
 	
-	// Convert to uppercase for comparison
-	std::string upperWord = currentWord;
-	std::transform(upperWord.begin(), upperWord.end(), upperWord.begin(), ::toupper);
+	// Convert to uppercase for comparison if language is case-insensitive
+	std::string searchWord = currentWord;
+	if (mLanguageDefinition && !mLanguageDefinition->mCaseSensitive)
+	{
+		std::transform(searchWord.begin(), searchWord.end(), searchWord.begin(), ::toupper);
+	}
 	
 	// Find matching keywords
 	mAutoCompleteSuggestions.clear();
 	
-	// Check SQL keywords
-	for (const auto& keyword : sqlKeywords)
+	// Check keywords from language definition
+	if (mLanguageDefinition)
 	{
-		if (keyword.find(upperWord) == 0 && keyword != upperWord)
+		for (const auto& keyword : mLanguageDefinition->mKeywords)
 		{
-			mAutoCompleteSuggestions.push_back(keyword);
+			std::string compareKeyword = keyword;
+			if (!mLanguageDefinition->mCaseSensitive)
+			{
+				std::transform(compareKeyword.begin(), compareKeyword.end(), compareKeyword.begin(), ::toupper);
+			}
+			
+			if (compareKeyword.find(searchWord) == 0 && compareKeyword != searchWord)
+			{
+				mAutoCompleteSuggestions.push_back(keyword);
+			}
 		}
 	}
 	
@@ -3926,7 +3919,7 @@ void TextEditor::UpdateAutoComplete()
 	{
 		std::string upperKeyword = keyword;
 		std::transform(upperKeyword.begin(), upperKeyword.end(), upperKeyword.begin(), ::toupper);
-		if (upperKeyword.find(upperWord) == 0 && upperKeyword != upperWord)
+		if (upperKeyword.find(searchWord) == 0 && upperKeyword != searchWord)
 		{
 			mAutoCompleteSuggestions.push_back(keyword);
 		}
